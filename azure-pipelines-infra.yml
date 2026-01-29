@@ -1,0 +1,146 @@
+trigger:
+  - main
+  - develop
+
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  LOCATION: 'eastus'
+  RESOURCE_GROUP: 'klrg'
+  RESOURCE_TOKEN: 'kljp'
+
+stages:
+  - stage: Provision_Dev
+    displayName: 'Provision Dev Environment'
+    jobs:
+      - job: CreateResources
+        displayName: 'Create Azure Resources'
+        steps:
+          - checkout: self
+          
+          - task: AzureCLI@2
+            displayName: 'Create Resource Group'
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az group create \
+                  --name $(RESOURCE_GROUP) \
+                  --location $(LOCATION) \
+                  --tags environment=dev
+
+          - task: AzureCLI@2
+            displayName: 'Create Container Registry'
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                REGISTRY_NAME="acr$(RESOURCE_TOKEN)"
+                
+                # Check if registry exists
+                if ! az acr show --resource-group $(RESOURCE_GROUP) --name $REGISTRY_NAME &>/dev/null; then
+                  az acr create \
+                    --resource-group $(RESOURCE_GROUP) \
+                    --name $REGISTRY_NAME \
+                    --sku Basic \
+                    --location $(LOCATION) \
+                    --admin-enabled true
+                fi
+                
+                # Get credentials
+                USERNAME=$(az acr credential show --resource-group $(RESOURCE_GROUP) --name $REGISTRY_NAME --query username -o tsv)
+                PASSWORD=$(az acr credential show --resource-group $(RESOURCE_GROUP) --name $REGISTRY_NAME --query passwords[0].value -o tsv)
+                
+                echo "##vso[task.setvariable variable=REGISTRY_NAME]$REGISTRY_NAME"
+                echo "##vso[task.setvariable variable=REGISTRY_USERNAME]$USERNAME"
+                echo "##vso[task.setvariable variable=REGISTRY_PASSWORD]$PASSWORD" isSecret=true
+
+          - task: AzureCLI@2
+            displayName: 'Create App Service Plan'
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                PLAN_NAME="plan$(RESOURCE_TOKEN)"
+                
+                if ! az appservice plan show --resource-group $(RESOURCE_GROUP) --name $PLAN_NAME &>/dev/null; then
+                  az appservice plan create \
+                    --resource-group $(RESOURCE_GROUP) \
+                    --name $PLAN_NAME \
+                    --sku B1 \
+                    --is-linux \
+                    --location $(LOCATION)
+                fi
+
+          - task: AzureCLI@2
+            displayName: 'Create Backend Web App'
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                PLAN_NAME="plan$(RESOURCE_TOKEN)"
+                APP_NAME_BACKEND="jobportal-api-$(RESOURCE_TOKEN)"
+                REGISTRY_NAME="acr$(RESOURCE_TOKEN)"
+                REGISTRY_URL="${{ REGISTRY_NAME }}.azurecr.io"
+                
+                if ! az webapp show --resource-group $(RESOURCE_GROUP) --name $APP_NAME_BACKEND &>/dev/null; then
+                  az webapp create \
+                    --resource-group $(RESOURCE_GROUP) \
+                    --plan $PLAN_NAME \
+                    --name $APP_NAME_BACKEND \
+                    --deployment-container-image-name-user "$(REGISTRY_USERNAME)" \
+                    --deployment-container-image-name-password "$(REGISTRY_PASSWORD)" \
+                    --deployment-container-image-name "$REGISTRY_URL/jobportal-api:latest" \
+                    --docker-registry-server-url "https://$REGISTRY_URL"
+                  
+                  # Configure app settings
+                  az webapp config appsettings set \
+                    --resource-group $(RESOURCE_GROUP) \
+                    --name $APP_NAME_BACKEND \
+                    --settings \
+                      SPRING_PROFILES_ACTIVE=prod \
+                      DOCKER_ENABLE_CI=true \
+                      DOCKER_REGISTRY_SERVER_URL="https://$REGISTRY_URL" \
+                      DOCKER_REGISTRY_SERVER_USERNAME="$(REGISTRY_USERNAME)" \
+                      DOCKER_REGISTRY_SERVER_PASSWORD="$(REGISTRY_PASSWORD)"
+                fi
+
+          - task: AzureCLI@2
+            displayName: 'Create Frontend Web App'
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                PLAN_NAME="plan$(RESOURCE_TOKEN)"
+                APP_NAME_FRONTEND="jobportal-web-$(RESOURCE_TOKEN)"
+                REGISTRY_NAME="acr$(RESOURCE_TOKEN)"
+                REGISTRY_URL="${{ REGISTRY_NAME }}.azurecr.io"
+                
+                if ! az webapp show --resource-group $(RESOURCE_GROUP) --name $APP_NAME_FRONTEND &>/dev/null; then
+                  az webapp create \
+                    --resource-group $(RESOURCE_GROUP) \
+                    --plan $PLAN_NAME \
+                    --name $APP_NAME_FRONTEND \
+                    --deployment-container-image-name-user "$(REGISTRY_USERNAME)" \
+                    --deployment-container-image-name-password "$(REGISTRY_PASSWORD)" \
+                    --deployment-container-image-name "$REGISTRY_URL/jobportal-web:latest" \
+                    --docker-registry-server-url "https://$REGISTRY_URL"
+                  
+                  # Configure app settings
+                  az webapp config appsettings set \
+                    --resource-group $(RESOURCE_GROUP) \
+                    --name $APP_NAME_FRONTEND \
+                    --settings \
+                      DOCKER_ENABLE_CI=true \
+                      DOCKER_REGISTRY_SERVER_URL="https://$REGISTRY_URL" \
+                      DOCKER_REGISTRY_SERVER_USERNAME="$(REGISTRY_USERNAME)" \
+                      DOCKER_REGISTRY_SERVER_PASSWORD="$(REGISTRY_PASSWORD)"
+                fi

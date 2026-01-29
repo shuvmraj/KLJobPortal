@@ -1,0 +1,284 @@
+trigger:
+  - main
+  - develop
+
+pr:
+  - main
+  - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  REGISTRY_NAME: 'acrklbkl'
+  RESOURCE_GROUP: 'klrg'
+  RESOURCE_TOKEN: 'kljp'
+
+stages:
+  - stage: CI
+    displayName: 'Build and Test'
+    jobs:
+      - job: BuildBackend
+        displayName: 'Build Backend'
+        steps:
+          - checkout: self
+
+          - task: Cache@2
+            displayName: 'Cache Maven Dependencies'
+            inputs:
+              key: 'maven | "$(Agent.OS)" | Backend/JobPortal/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+                maven
+              path: $(HOME)/.m2/repository
+
+          - task: JavaToolInstaller@0
+            displayName: 'Install Java 21'
+            inputs:
+              versionSpec: '21'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+
+          - task: Maven@3
+            displayName: 'Maven Clean Build'
+            inputs:
+              mavenPomFile: 'Backend/JobPortal/pom.xml'
+              mavenOptions: '-Xmx3072m'
+              javaHomeOption: 'JDKVersion'
+              jdkVersionOption: '1.21'
+              goals: 'clean package -DskipTests'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Backend Artifact'
+            inputs:
+              PathtoPublish: 'Backend/JobPortal/target'
+              ArtifactName: 'backend-build'
+              publishLocation: 'Container'
+
+      - job: BuildFrontend
+        displayName: 'Build Frontend'
+        steps:
+          - checkout: self
+
+          - task: Cache@2
+            displayName: 'Cache npm Dependencies'
+            inputs:
+              key: 'npm | "$(Agent.OS)" | Frontend/vite-project/package-lock.json'
+              restoreKeys: |
+                npm | "$(Agent.OS)"
+                npm
+              path: $(npm_config_cache)
+
+          - task: NodeTool@0
+            displayName: 'Install Node.js 20'
+            inputs:
+              versionSpec: '20.x'
+
+          - script: |
+              cd Frontend/vite-project
+              npm ci
+              npm run build
+            displayName: 'Install Dependencies and Build'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Frontend Artifact'
+            inputs:
+              PathtoPublish: 'Frontend/vite-project/dist'
+              ArtifactName: 'frontend-build'
+              publishLocation: 'Container'
+
+  - stage: CD_Dev
+    displayName: 'Deploy to Dev'
+    dependsOn: 'CI'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: DeployBackendDev
+        displayName: 'Deploy Backend to Dev'
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Build and Push Backend Image'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      IMAGE_TAG="dev-$(Build.BuildId)"
+                      
+                      az acr build \
+                        --registry $(REGISTRY_NAME) \
+                        --image jobportal-api:$IMAGE_TAG \
+                        --image jobportal-api:latest \
+                        --file Backend/JobPortal/Dockerfile \
+                        Backend/JobPortal
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Backend to App Service'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      APP_NAME="jobportal-api-$(RESOURCE_TOKEN)"
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      
+                      az webapp deployment container config \
+                        --name $APP_NAME \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --enable-cd true
+                      
+                      az webapp config container set \
+                        --name $APP_NAME \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --docker-custom-image-name "$REGISTRY_URL/jobportal-api:latest" \
+                        --docker-registry-server-url "https://$REGISTRY_URL" \
+                        --docker-registry-server-username "$(REGISTRY_USERNAME)" \
+                        --docker-registry-server-password "$(REGISTRY_PASSWORD)"
+
+      - deployment: DeployFrontendDev
+        displayName: 'Deploy Frontend to Dev'
+        environment: 'dev'
+        dependsOn: 'DeployBackendDev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Build and Push Frontend Image'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      IMAGE_TAG="dev-$(Build.BuildId)"
+                      
+                      az acr build \
+                        --registry $(REGISTRY_NAME) \
+                        --image jobportal-web:$IMAGE_TAG \
+                        --image jobportal-web:latest \
+                        --file Frontend/vite-project/Dockerfile \
+                        Frontend/vite-project
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Frontend to App Service'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      APP_NAME="jobportal-web-$(RESOURCE_TOKEN)"
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      
+                      az webapp deployment container config \
+                        --name $APP_NAME \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --enable-cd true
+                      
+                      az webapp config container set \
+                        --name $APP_NAME \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --docker-custom-image-name "$REGISTRY_URL/jobportal-web:latest" \
+                        --docker-registry-server-url "https://$REGISTRY_URL" \
+                        --docker-registry-server-username "$(REGISTRY_USERNAME)" \
+                        --docker-registry-server-password "$(REGISTRY_PASSWORD)"
+
+  - stage: CD_Staging
+    displayName: 'Deploy to Staging'
+    dependsOn: 'CD_Dev'
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployBackendStaging
+        displayName: 'Deploy Backend to Staging'
+        environment: 'staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Build and Push Backend Image'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      IMAGE_TAG="staging-$(Build.BuildId)"
+                      
+                      az acr build \
+                        --registry $(REGISTRY_NAME) \
+                        --image jobportal-api:$IMAGE_TAG \
+                        --file Backend/JobPortal/Dockerfile \
+                        Backend/JobPortal
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Backend to App Service'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      APP_NAME="jobportal-api-staging-$(RESOURCE_TOKEN)"
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      
+                      az webapp config container set \
+                        --name $APP_NAME \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --docker-custom-image-name "$REGISTRY_URL/jobportal-api:staging-$(Build.BuildId)" \
+                        --docker-registry-server-url "https://$REGISTRY_URL" \
+                        --docker-registry-server-username "$(REGISTRY_USERNAME)" \
+                        --docker-registry-server-password "$(REGISTRY_PASSWORD)"
+
+      - deployment: DeployFrontendStaging
+        displayName: 'Deploy Frontend to Staging'
+        environment: 'staging'
+        dependsOn: 'DeployBackendStaging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Build and Push Frontend Image'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      IMAGE_TAG="staging-$(Build.BuildId)"
+                      
+                      az acr build \
+                        --registry $(REGISTRY_NAME) \
+                        --image jobportal-web:$IMAGE_TAG \
+                        --file Frontend/vite-project/Dockerfile \
+                        Frontend/vite-project
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Frontend to App Service'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      APP_NAME="jobportal-web-staging-$(RESOURCE_TOKEN)"
+                      REGISTRY_URL="$(REGISTRY_NAME).azurecr.io"
+                      
+                      az webapp config container set \
+                        --name $APP_NAME \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --docker-custom-image-name "$REGISTRY_URL/jobportal-web:staging-$(Build.BuildId)" \
+                        --docker-registry-server-url "https://$REGISTRY_URL" \
+                        --docker-registry-server-username "$(REGISTRY_USERNAME)" \
+                        --docker-registry-server-password "$(REGISTRY_PASSWORD)"
